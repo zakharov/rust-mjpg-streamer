@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::io;
-
-use clap::Parser;
-
 use async_std::prelude::FutureExt;
+use clap::Parser;
+use std::io;
+use tide_rustls::TlsListener;
 use v4l::device::Device;
+use v4l::framesize::Discrete;
 use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 
@@ -40,7 +40,8 @@ const HUFFMAN: [u8; 420] = [
 ];
 
 #[derive(Parser, Debug)]
-#[command(author, version = option_env!("RUSTY_MJPG_VERSION").unwrap_or_else(|| "dev"), about, long_about = None)]
+#[command(author, version = option_env!("RUSTY_MJPG_VERSION").unwrap_or_else(|| "dev"), about, long_about = None
+)]
 struct CommandLineArguments {
   #[arg(short = 'd', long)]
   device: String,
@@ -56,6 +57,22 @@ struct CommandLineArguments {
     "#
   )]
   huffman: bool,
+
+  #[arg(
+    short = 'r',
+    long,
+    help = r#"Resolution of the stream. This is a string of the form "WIDTHxHEIGHT", where WIDTH and HEIGHT are integers.
+    "#
+  )]
+  resolution: Option<String>,
+
+  #[arg(
+    short = 'l',
+    long,
+    help = r#"Output avaliavle resolutions in the console.
+    "#
+  )]
+  list: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -88,7 +105,7 @@ async fn access(_request: tide::Request<SharedState>) -> tide::Result<tide::Resp
 }
 
 async fn stream(request: tide::Request<SharedState>) -> tide::Result<tide::Response> {
-  // Create the channel whose receiver will be used as a async reader.
+  // Create the channel whose receiver will be used as an async reader.
   let (writer, drain) = async_std::channel::bounded(2);
   let buf_drain = futures::stream::TryStreamExt::into_async_read(drain);
 
@@ -103,7 +120,7 @@ async fn stream(request: tide::Request<SharedState>) -> tide::Result<tide::Respo
     .body(tide::Body::from_reader(buf_drain, None))
     .build();
 
-  // In a separate task, continously check our shared buffer's timestamp. If that value differs
+  // In a separate task, continuously check our shared buffer's timestamp. If that value differs
   // from the timestamp of the last message sent on our end, send a new multipart chunk.
   async_std::task::spawn(async move {
     let mut last_frame = None;
@@ -118,7 +135,7 @@ async fn stream(request: tide::Request<SharedState>) -> tide::Result<tide::Respo
       }
 
       // Pull the mutext lock for read access and verify a timestamp is available and different
-      // than our last.
+      // from our last.
       let frame_reader = request.state().last_frame.read().await;
 
       if frame_reader.0.is_none() {
@@ -136,7 +153,7 @@ async fn stream(request: tide::Request<SharedState>) -> tide::Result<tide::Respo
         continue;
       }
 
-      // Start the buffer that we'll send using the boundary and some multi-part http header
+      // Start the buffer that we'll send using the boundary and some multipart http header
       // context.
       let mut buffer = format!(
         "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
@@ -170,9 +187,50 @@ async fn stream(request: tide::Request<SharedState>) -> tide::Result<tide::Respo
   Ok(response)
 }
 
+fn parse_resolution(resolution: Option<&str>) -> Discrete {
+  match resolution {
+    None => Discrete {
+      width: 640,
+      height: 480,
+    },
+    Some(resolution) => {
+      let mut split = resolution.splitn(2, 'x');
+      Discrete {
+        width: split.next().unwrap().parse::<u32>().unwrap(),
+        height: split.next().unwrap().parse::<u32>().unwrap(),
+      }
+    }
+  }
+}
+
+fn list_resolutions_and_exit(list: bool, dev: &Device, mjpg: &v4l::FourCC) -> bool {
+  if list == true {
+    for desc in dev.enum_formats().unwrap() {
+      if desc.fourcc != *mjpg {
+        continue;
+      }
+
+      for framesize in dev.enum_framesizes(desc.fourcc).unwrap() {
+        for discrete in framesize.size.to_discrete() {
+          println!("found mjpg framesize - {}x{}", discrete.width, discrete.height);
+        }
+      }
+    }
+    return true;
+  }
+  false
+}
+
 async fn run(arguments: CommandLineArguments) -> io::Result<()> {
   let mjpg = v4l::FourCC::new(b"MJPG");
   let dev = Device::with_path(&arguments.device)?;
+
+  if list_resolutions_and_exit(arguments.list, &dev, &mjpg) {
+    return Ok(());
+  }
+
+  let resoultion = parse_resolution(arguments.resolution.as_deref());
+  log::info!("Selected resolution:{resoultion:?}");
 
   let caps = dev.query_caps()?;
   log::info!("caps: {caps:?}");
@@ -180,30 +238,14 @@ async fn run(arguments: CommandLineArguments) -> io::Result<()> {
   let ctrls = dev.query_controls()?;
   log::info!("ctrls: {ctrls:?}");
 
-  let mut format = dev.format()?;
+  let f = v4l::Format::new(resoultion.width, resoultion.height, mjpg);
+  dev.set_format(&f)?;
+  let format = dev.format()?;
+  // dev.
   log::info!("active format: ({:?}) {format:?}", format.fourcc.str());
 
   let params = dev.params()?;
   log::info!("active parameters: {params:?}");
-
-  for desc in dev.enum_formats()? {
-    if desc.fourcc != mjpg {
-      log::info!("found non-jpeg format: {:?}", desc.fourcc.str());
-      continue;
-    }
-
-    for framesize in dev.enum_framesizes(desc.fourcc)? {
-      for discrete in framesize.size.to_discrete() {
-        log::info!("found mjpg framesize - {}x{}", discrete.width, discrete.height);
-
-        if discrete.width < format.width && discrete.height < format.height {
-          let f = v4l::Format::new(discrete.width, discrete.height, mjpg);
-          dev.set_format(&f)?;
-          format = dev.format()?;
-        }
-      }
-    }
-  }
 
   if format.fourcc != mjpg {
     return Err(io::Error::new(io::ErrorKind::Other, "mjpg-format not supported"));
@@ -221,7 +263,7 @@ async fn run(arguments: CommandLineArguments) -> io::Result<()> {
 
   let reader_thread = async_std::task::spawn(async move {
     let frame_locker = last_frame_index.clone();
-    let mut stream = v4l::prelude::MmapStream::with_buffers(&dev, v4l::buffer::Type::VideoCapture, 4).unwrap();
+    let mut stream = v4l::prelude::MmapStream::with_buffers(&dev, v4l::buffer::Type::VideoCapture, 4)?;
     let mut last_debug = std::time::Instant::now();
     let mut current_frames = 0;
     let mut listeners = vec![];
@@ -329,7 +371,12 @@ async fn run(arguments: CommandLineArguments) -> io::Result<()> {
   server.at("/snapshot").get(snapshot);
 
   server
-    .listen(&arguments.addr)
+    .listen(
+      TlsListener::build()
+        .addrs("0.0.0.0:4443")
+        .cert("/etc/ssl/certs/motorcortex.pem")
+        .key("/etc/ssl/certs/motorcortex.pem"),
+    )
     .race(reader_thread)
     .await
     .map_err(|error| {
@@ -342,5 +389,6 @@ async fn run(arguments: CommandLineArguments) -> io::Result<()> {
 fn main() -> io::Result<()> {
   env_logger::init();
   let arguments = CommandLineArguments::parse();
+
   async_std::task::block_on(run(arguments))
 }
